@@ -36,9 +36,27 @@ class AccountPool:
     def __init__(self, accounts: list[CloudflareAccount]) -> None:
         self._accounts = accounts
         self._cursor = itertools.count()
+        self._rate_limited_until: dict[str, float] = {}
+
+    def report_rate_limit(self, account: CloudflareAccount, wait_seconds: float = 60.0) -> None:
+        self._rate_limited_until[account.account_id] = time.time() + wait_seconds
 
     def next_attempts(self, max_attempts: int, usage_tracker: 'UsageTracker | None' = None) -> list[CloudflareAccount]:
         candidates = self._accounts
+        now = time.time()
+        
+        # Filter out currently rate-limited accounts
+        available_candidates = [
+            acc for acc in candidates
+            if self._rate_limited_until.get(acc.account_id, 0.0) < now
+        ]
+        
+        # Fallback to all candidates if all are rate-limited to at least try something
+        if not available_candidates:
+            available_candidates = candidates
+            
+        candidates = available_candidates
+
         if usage_tracker:
             valid = []
             for acc in self._accounts:
@@ -51,7 +69,7 @@ class AccountPool:
         if not candidates:
             return []
 
-        attempts = min(max_attempts, len(candidates))
+        attempts = len(candidates)
         start = next(self._cursor)
         return [candidates[(start + offset) % len(candidates)] for offset in range(attempts)]
 
@@ -438,6 +456,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     }
                 )
                 return await _tracked_response(upstream_response, account, usage_tracker)
+
+            if upstream_response.status_code == 429:
+                # Tell the pool to avoid this account for a short time
+                # If there is a Retry-After header we can use it, otherwise default to 60s
+                retry_after = upstream_response.headers.get("retry-after")
+                wait_seconds = 60.0
+                if retry_after:
+                    try:
+                        wait_seconds = float(retry_after)
+                    except ValueError:
+                        pass
+                pool.report_rate_limit(account, wait_seconds)
 
             last_response = upstream_response
             await upstream_response.aclose()
